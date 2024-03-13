@@ -5,6 +5,7 @@ import argparse
 import cv2
 import numpy as np
 from tflite_runtime import interpreter as tflite
+import time
 
 #from ultralytics.utils import ASSETS, yaml_load
 #from ultralytics.utils.checks import check_yaml
@@ -85,7 +86,7 @@ class LetterBox:
 
 
 class Yolov8TFLite:
-    def __init__(self, tflite_model, input_image, confidence_thres, iou_thres, use_edgetpu):
+    def __init__(self, tflite_model, input_image, confidence_thres, iou_thres, use_edgetpu, threads):
         """
         Initializes an instance of the Yolov8TFLite class.
 
@@ -111,6 +112,8 @@ class Yolov8TFLite:
         self.color_palette = np.random.uniform(0, 255, size=(len(self.classes), 3))
 
         self.use_edgetpu = use_edgetpu
+        self.threads = threads
+        self.preload()
 
     def draw_detections(self, img, box, score, class_id):
         """
@@ -168,7 +171,6 @@ class Yolov8TFLite:
         # Read the input image using OpenCV
         self.img = cv2.imread(self.input_image)
 
-        print("image before", self.img)
         # Get the height and width of the input image
         self.img_height, self.img_width = self.img.shape[:2]
 
@@ -240,56 +242,47 @@ class Yolov8TFLite:
             output_img: The output image with drawn detections.
         """
 
-        # Create an interpreter for the TFLite model
-        print("Loaded model")
-        if self.use_edgetpu:
-            interpreter = tflite.Interpreter(model_path=self.tflite_model,
-                experimental_delegates=[tflite.load_delegate('libedgetpu.so.1')])
-        else:
-            interpreter = tflite.Interpreter(model_path=self.tflite_model)
-        self.model = interpreter
-        interpreter.allocate_tensors()
-
-        # Get the model inputs
-        input_details = interpreter.get_input_details()
-        output_details = interpreter.get_output_details()
-
-        # Store the shape of the input for later use
-        input_shape = input_details[0]["shape"]
-        self.input_width = input_shape[1]
-        self.input_height = input_shape[2]
-
-        # Preprocess the image data
-        q = input_details[0]['quantization']
-        img_data = self.preprocess(q)
-        img_data = img_data
-        # img_data = img_data.cpu().numpy()
+        img_data = self.preprocess(self.q)
         # Set the input tensor to the interpreter
-        print(input_details[0]["index"])
-        print(img_data.shape)
         img_data = img_data.transpose((0, 2, 3, 1))
 
-        scale, zero_point = input_details[0]["quantization"]
-        interpreter.set_tensor(input_details[0]["index"], img_data)
-
-        print("+invoke")
+        self.interpreter.set_tensor(self.input_details[0]["index"], img_data)
 
         # Run inference
-        interpreter.invoke()
+        self.interpreter.invoke()
 
-        print("-invoke")
-
-        # Get the output tensor from the interpreter
-        output = interpreter.get_tensor(output_details[0]["index"])
-        scale, zero_point = output_details[0]["quantization"]
+        # Get the output tensor from the self.interpreter
+        output = self.interpreter.get_tensor(self.output_details[0]["index"])
+        scale, zero_point = self.output_details[0]["quantization"]
         output = (output.astype(np.float32) - zero_point) * scale
 
         output[:, [0, 2]] *= img_width
         output[:, [1, 3]] *= img_height
-        print(output)
         # Perform post-processing on the outputs to obtain output image.
         return self.postprocess(self.img, output)
 
+    def preload(self):
+        # Create an interpreter for the TFLite model
+        print("Loaded model")
+        if self.use_edgetpu:
+            self.interpreter = tflite.Interpreter(model_path=self.tflite_model,
+                experimental_delegates=[tflite.load_delegate('libedgetpu.so.1')], num_threads=self.threads)
+        else:
+            self.interpreter = tflite.Interpreter(model_path=self.tflite_model, num_threads=self.threads)
+        self.model = self.interpreter
+        self.interpreter.allocate_tensors()
+
+        # Get the model inputs
+        self.input_details = self.interpreter.get_input_details()
+        self.output_details = self.interpreter.get_output_details()
+
+        # Store the shape of the input for later use
+        input_shape = self.input_details[0]["shape"]
+        self.input_width = input_shape[1]
+        self.input_height = input_shape[2]
+
+        # Preprocess the image data
+        self.q = self.input_details[0]['quantization']
 
 if __name__ == "__main__":
     # Create an argument parser to handle command-line arguments
@@ -301,13 +294,21 @@ if __name__ == "__main__":
     parser.add_argument("--conf-thres", type=float, default=0.5, help="Confidence threshold")
     parser.add_argument("--iou-thres", type=float, default=0.5, help="NMS IoU threshold")
     parser.add_argument("--edgetpu", action='store_true', help='Use Coral TPU')
+    parser.add_argument("--threads", type=int, default=4, help='Number of threads to use')
     args = parser.parse_args()
 
     # Create an instance of the Yolov8TFLite class with the specified arguments
-    detection = Yolov8TFLite(args.model, args.img, args.conf_thres, args.iou_thres, args.edgetpu)
+    detection = Yolov8TFLite(args.model, args.img, args.conf_thres, args.iou_thres, args.edgetpu, args.threads)
 
     # Perform object detection and obtain the output image
-    output_image = detection.main()
+    runs = 100
+    start = time.time()
+    for i in range(runs):
+        output_image = detection.main()
+    stop = time.time()
+    infers = (stop - start) / runs
+    fps = 1/infers
+    print(f'Infers: {infers} FPS: {fps}')
 
     # Display the output image in a window
     cv2.imshow("Output", output_image)
