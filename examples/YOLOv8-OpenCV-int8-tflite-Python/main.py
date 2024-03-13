@@ -6,12 +6,12 @@ import cv2
 import numpy as np
 from tflite_runtime import interpreter as tflite
 
-from ultralytics.utils import ASSETS, yaml_load
-from ultralytics.utils.checks import check_yaml
+#from ultralytics.utils import ASSETS, yaml_load
+#from ultralytics.utils.checks import check_yaml
 
 # Declare as global variables, can be updated based trained model image size
-img_width = 640
-img_height = 640
+img_width = 320
+img_height = 320
 
 
 class LetterBox:
@@ -85,7 +85,7 @@ class LetterBox:
 
 
 class Yolov8TFLite:
-    def __init__(self, tflite_model, input_image, confidence_thres, iou_thres):
+    def __init__(self, tflite_model, input_image, confidence_thres, iou_thres, use_edgetpu):
         """
         Initializes an instance of the Yolov8TFLite class.
 
@@ -102,10 +102,15 @@ class Yolov8TFLite:
         self.iou_thres = iou_thres
 
         # Load the class names from the COCO dataset
-        self.classes = yaml_load(check_yaml("coco128.yaml"))["names"]
+        #self.classes = yaml_load(check_yaml("coco128.yaml"))["names"]
+        self.classes = []
+        for i in range(80):
+            self.classes.append(i)
 
         # Generate a color palette for the classes
         self.color_palette = np.random.uniform(0, 255, size=(len(self.classes), 3))
+
+        self.use_edgetpu = use_edgetpu
 
     def draw_detections(self, img, box, score, class_id):
         """
@@ -152,7 +157,7 @@ class Yolov8TFLite:
         # Draw the label text on the image
         cv2.putText(img, label, (int(label_x), int(label_y)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1, cv2.LINE_AA)
 
-    def preprocess(self):
+    def preprocess(self, q):
         """
         Preprocesses the input image before performing inference.
 
@@ -175,7 +180,8 @@ class Yolov8TFLite:
         img = np.ascontiguousarray(image)
         # n, h, w, c
         image = img.astype(np.float32)
-        return image / 255
+        image = np.round((image + q[1]) * q[0], 0)
+        return image.astype('int8')
 
     def postprocess(self, input_image, output):
         """
@@ -235,7 +241,12 @@ class Yolov8TFLite:
         """
 
         # Create an interpreter for the TFLite model
-        interpreter = tflite.Interpreter(model_path=self.tflite_model)
+        print("Loaded model")
+        if self.use_edgetpu:
+            interpreter = tflite.Interpreter(model_path=self.tflite_model,
+                experimental_delegates=[tflite.load_delegate('libedgetpu.so.1')])
+        else:
+            interpreter = tflite.Interpreter(model_path=self.tflite_model)
         self.model = interpreter
         interpreter.allocate_tensors()
 
@@ -249,7 +260,8 @@ class Yolov8TFLite:
         self.input_height = input_shape[2]
 
         # Preprocess the image data
-        img_data = self.preprocess()
+        q = input_details[0]['quantization']
+        img_data = self.preprocess(q)
         img_data = img_data
         # img_data = img_data.cpu().numpy()
         # Set the input tensor to the interpreter
@@ -260,8 +272,12 @@ class Yolov8TFLite:
         scale, zero_point = input_details[0]["quantization"]
         interpreter.set_tensor(input_details[0]["index"], img_data)
 
+        print("+invoke")
+
         # Run inference
         interpreter.invoke()
+
+        print("-invoke")
 
         # Get the output tensor from the interpreter
         output = interpreter.get_tensor(output_details[0]["index"])
@@ -281,13 +297,14 @@ if __name__ == "__main__":
     parser.add_argument(
         "--model", type=str, default="yolov8n_full_integer_quant.tflite", help="Input your TFLite model."
     )
-    parser.add_argument("--img", type=str, default=str(ASSETS / "bus.jpg"), help="Path to input image.")
+    parser.add_argument("--img", type=str, default="bus.jpg", help="Path to input image.")
     parser.add_argument("--conf-thres", type=float, default=0.5, help="Confidence threshold")
     parser.add_argument("--iou-thres", type=float, default=0.5, help="NMS IoU threshold")
+    parser.add_argument("--edgetpu", action='store_true', help='Use Coral TPU')
     args = parser.parse_args()
 
     # Create an instance of the Yolov8TFLite class with the specified arguments
-    detection = Yolov8TFLite(args.model, args.img, args.conf_thres, args.iou_thres)
+    detection = Yolov8TFLite(args.model, args.img, args.conf_thres, args.iou_thres, args.edgetpu)
 
     # Perform object detection and obtain the output image
     output_image = detection.main()
